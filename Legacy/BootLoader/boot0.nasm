@@ -226,495 +226,140 @@ hang:
 
 
 ;--------------------------------------------------------------------------
-; Find the active (boot) partition and load the booter from the partition.
+; Find the booter partition in the MBR partition table.
 ;
-; Arguments:
-;   DL = drive number (0x80 + unit number)
-;   SI = pointer to fdisk partition table.
+; Input:
+;   si = pointer to partition table
 ;
-; Clobber list:
-;   EAX, BX, EBP
+; Output:
+;   dl = partition number
+;   es:bx = partition table entry
+;
+; On success, the booter partition is loaded into memory and control
+; is transferred to the booter.
 ;
 find_boot:
+    mov     dl, 0                   ; partition number
+    mov     cx, kPartCount          ; number of partitions to check
+    mov     bx, si                  ; pointer to partition table
 
-    ;
-    ; Check for boot block signature 0xAA55 following the 4 partition
-    ; entries.
-    ;
-    cmp     WORD [si + part_size * kPartCount], kBootSignature
-    jne     .exit                       ; boot signature not found.
+find_boot_loop:
+    cmp     [bx], kPartActive       ; active flag
+    jne     find_boot_next          ; not active
 
-    xor     bx, bx                      ; BL will be set to 1 later in case of
-                                        ; Protective MBR has been found
+    mov     al, [bx+kPartType]      ; partition type
+    cmp     al, kPartTypeFAT32      ; FAT32 partition type
+    je      find_boot_found         ; found it
 
-.start_scan:
-    mov     cx, kPartCount              ; number of partition entries per table
+find_boot_next:
+    add     bx, kPartSize           ; next partition table entry
+    inc     dl                      ; next partition number
+    loop    find_boot_loop          ; loop until all partitions checked
 
-.loop:
+    LogString(boot_error_str)
+    jmp     hang
 
-    ;
-    ; First scan through the partition table looking for the active
-    ; partition.
-    ;
-%if DEBUG
-    mov     al, [si + part.type]       ; print partition type
-    call    print_hex
-%endif
-
-    mov     eax, [si + part.lba]                    ; save starting LBA of current
-    mov     [my_lba], eax                           ; MBR partition entry for read_lba function
-    cmp     BYTE [si + part.type], 0                ; unused partition?
-    je      .continue                               ; skip to next entry
-    cmp     BYTE [si + part.type], kPartTypePMBR    ; check for Protective MBR
-    jne     .tryToBootIfActive
-
-    mov     BYTE [si + part.bootid], kPartInactive  ; found Protective MBR
-                                                    ; clear active flag to make sure this protective
-                                                    ; partition won't be used as a bootable partition.
-    mov     bl, 1                                   ; Assume we can deal with GPT but try to scan
-                                                    ; later if not found any other bootable partitions.
-
-.tryToBootIfActive:
-    ; We're going to try to boot a partition if it is active
-    cmp     BYTE [si + part.bootid], kPartActive
-    jne     .continue
-
-    ;
-    ; Found boot partition, read boot sector to memory.
-    ;
-
-    xor     dh, dh      ; Argument for loadBootSector to skip file system signature check.
-    call    loadBootSector
-    jne     .continue
-    jmp     SHORT initBootLoader
-
-.continue:
-    add     si, BYTE part_size              ; advance SI to next partition entry
-    loop    .loop                           ; loop through all partition entries
-
-    ;
-    ; Scanned all partitions but not found any with active flag enabled
-    ; Anyway if we found a protective MBR before we still have a chance
-    ; for a possible GPT Header at LBA 1
-    ;
-    dec     bl
-    jnz     .exit                           ; didn't find Protective MBR before
-    call    checkGPT
-
-.exit:
-    ret                                     ; Giving up.
-
-
-    ;
-    ; Jump to partition booter. The drive number is already in register DL.
-    ; SI is pointing to the modified partition entry.
-    ;
-initBootLoader:
-
-DebugChar('J')
-
-%if VERBOSE
-    LogString(done_str)
-%endif
-
-    jmp     kBoot1LoadAddr
-
-    ;
-    ; Found Protective MBR Partition Type: 0xEE
-    ; Check for 'EFI PART' string at the beginning
-    ; of LBA1 for possible GPT Table Header
-    ;
-checkGPT:
-    push    bx
-
-    mov     di, kLBA1Buffer                     ; address of GUID Partition Table Header
-    cmp     DWORD [di], kGPTSignatureLow        ; looking for 'EFI '
-    jne     .exit                               ; not found. Giving up.
-    cmp     DWORD [di + 4], kGPTSignatureHigh   ; looking for 'PART'
-    jne     .exit                               ; not found. Giving up indeed.
-    mov     si, di
-
-    ;
-    ; Loading GUID Partition Table Array
-    ;
-    mov     eax, [si + gpth.PartitionEntryLBA]          ; starting LBA of GPT Array
-    mov     [my_lba], eax                               ; save starting LBA for read_lba function
-    mov     cx, [si + gpth.NumberOfPartitionEntries]    ; number of GUID Partition Array entries
-    mov     bx, [si + gpth.SizeOfPartitionEntry]        ; size of GUID Partition Array entry
-
-    push    bx                                          ; push size of GUID Partition entry
-
-    ;
-    ; Current GPT Arrays uses 128 partition entries each 128 bytes long
-    ; 128 entries * 128 bytes long GPT Array entries / 512 bytes per sector = 32 sectors
-    ;
-    mov     al, 32                  ; maximum sector size of GPT Array (hardcoded method)
-
-    mov     bx, kGPTABuffer
-    push    bx                      ; push address of GPT Array
-    call    load                    ; read GPT Array
-    pop     si                      ; SI = address of GPT Array
-    pop     bx                      ; BX = size of GUID Partition Array entry
-    jc      error
-
-    ;
-    ; Walk through GUID Partition Table Array
-    ; and load boot record from first supported partition.
-    ;
-    ; If it has boot signature (0xAA55) then jump to it
-    ; otherwise skip to next partition.
-    ;
-
-%if VERBOSE
-    LogString(gpt_str)
-%endif
-
-.gpt_loop:
-
-    mov     eax, [si + gpta.PartitionTypeGUID + kGUIDLastDwordOffs]
-
-    ;
-    ; Try EFI System Partition
-    ;
-    cmp     eax, kEFISystemGUID     ; check current GUID Partition for EFI System Partition GUID type
-    je      .gpt_ok
-
-    ;
-    ; Also try FAT2 System Partition
-    ;
-    cmp     eax, kBasicDataGUID     ; check current GUID Partition for Basic Data Partition GUID type
-    jne     .gpt_continue
-
-.gpt_ok:
-    ;
-    ; Found a possible good partition try to boot it
-    ;
-
-    mov     eax, [si + gpta.StartingLBA]            ; load boot sector from StartingLBA
-    mov     [my_lba], eax
-    mov     dh, 1                                   ; Argument for loadBootSector to check file system signature.
-    call    loadBootSector
-    jne     .gpt_continue                           ; no boot loader signature
-
-    mov     si, kMBRPartTable                       ; fake the current GUID Partition
-    mov     [si + part.lba], eax                    ; as MBR style partition for boot1f32,
-    mov     BYTE [si + part.type], kPartTypeFAT32   ; set filesystem type for cosmetic reasons
-    jmp     SHORT initBootLoader
-
-.gpt_continue:
-
-    add     si, bx                                  ; advance SI to next partition entry
-    loop    .gpt_loop                               ; loop through all partition entries
-
-.exit:
-    pop     bx
-    ret                                             ; no more GUID partitions. Giving up.
-
-
-;--------------------------------------------------------------------------
-; loadBootSector - Load boot sector
-;
-; Arguments:
-;   DL = drive number (0x80 + unit number)
-;   DH = 0 skip file system signature checking
-;        1 enable file system signature checking
-;   [my_lba] = starting LBA.
-;
-; Returns:
-;   ZF = 0 if boot sector hasn't kBootSignature
-;        1 if boot sector has kBootSignature
-;
-loadBootSector:
-    pusha
-
-    mov     al, 3
-    mov     bx, kBoot1LoadAddr
+find_boot_found:
+    mov     es, bx                  ; es:bx = partition table entry
+    mov     bx, kBoot0LoadAddr      ; load address
+    mov     al, 1                   ; load one sector
     call    load
-    jc      error
+    jc      error                   ; load error
 
-    or      dh, dh
-    jz      .checkBootSignature
-
-%if VERBOSE
-    LogString(test_str)
-%endif
-
-    ;
-    ; Looking for boot1f32 magic string.
-    ;
-    mov     ax, [kBoot1LoadAddr + kFAT32BootCodeOffset]
-    cmp     ax, kBoot1FAT32Magic
-    jne     .exit
-
-.checkBootSignature:
-    ;
-    ; Check for boot block signature 0xAA55
-    ;
-    cmp     WORD [kBoot1LoadAddr + kSectorBytes - 2], kBootSignature
-
-.exit:
-
-    popa
-
-    ret
-
+    mov     ax, kBoot0LoadAddr      ; booter load address
+    jmp     ax                      ; transfer control to booter
 
 ;--------------------------------------------------------------------------
-; load - Load one or more sectors from a partition.
+; Load a sector or sectors from the disk.
 ;
-; Arguments:
-;   AL = number of 512-byte sectors to read.
-;   ES:BX = pointer to where the sectors should be stored.
-;   DL = drive number (0x80 + unit number)
-;   [my_lba] = starting LBA.
+; Input:
+;   al = number of sectors to load
+;   bx = load address
+;   [my_lba] = LBA sector number
 ;
-; Returns:
-;   CF = 0 success
-;        1 error
+; Output:
+;   al = 0 on success, 1 on error
 ;
 load:
-    push    cx
+    push    ds                      ; save ds
+    mov     ds, bx                  ; ds:bx = load address
+    mov     cx, kSectorSize         ; sector size
+    mov     dx, kDiskPort           ; disk port
+    mov     ah, kDiskRead           ; read command
+    mov     ch, [my_lba+3]          ; high byte of LBA
+    mov     cl, [my_lba+2]          ; middle byte of LBA
+    mov     dh, [my_lba+1]          ; head
+    mov     dl, [my_lba]            ; sector
+    and     dl, kSectorMask         ; mask off high bits
+    inc     dl                      ; sector number is 1-based
+    mov     bl, kDiskDrive          ; disk drive
+    mov     al, 0                   ; clear carry flag
+    int     kDiskInt                ; read sector
+    jc      load_error              ; error
 
-.ebios:
-    mov     cx, 5                   ; load retry count
-.ebios_loop:
-    call    read_lba                ; use INT13/F42
-    jnc     .exit
-    loop    .ebios_loop
+    mov     al, 1                   ; number of sectors to read
+    cmp     al, dl                  ; compare to sector number
+    jbe     load_done               ; done if sector number <= 1
 
-.exit:
-    pop     cx
+    mov     al, 0                   ; clear carry flag
+    int     kDiskInt                ; read next sector
+    jc      load_error              ; error
+
+load_done:
+    xor     al, al                  ; success
+    pop     ds                      ; restore ds
     ret
 
-
-;--------------------------------------------------------------------------
-; read_lba - Read sectors from a partition using LBA addressing.
-;
-; Arguments:
-;   AL = number of 512-byte sectors to read (valid from 1-127).
-;   ES:BX = pointer to where the sectors should be stored.
-;   DL = drive number (0x80 + unit number)
-;   [my_lba] = starting LBA.
-;
-; Returns:
-;   CF = 0 success
-;        1 error
-;
-read_lba:
-    pushad                          ; save all registers
-    mov     bp, sp                  ; save current SP
-
-    ;
-    ; Create the Disk Address Packet structure for the
-    ; INT13/F42 (Extended Read Sectors) on the stack.
-    ;
-
-;   push    DWORD 0                 ; offset 12, upper 32-bit LBA
-    push    ds                      ; For sake of saving memory,
-    push    ds                      ; push DS register, which is 0.
-    mov     ecx, [my_lba]           ; offset 8, lower 32-bit LBA
-    push    ecx
-    push    es                      ; offset 6, memory segment
-    push    bx                      ; offset 4, memory offset
-    xor     ah, ah                  ; offset 3, must be 0
-    push    ax                      ; offset 2, number of sectors
-
-    ; It pushes 2 bytes with a smaller opcode than if WORD was used
-    push    BYTE 16                 ; offset 0-1, packet size
-
-    DebugChar('<')
-%if DEBUG
-    mov  eax, ecx
-    call print_hex
-%endif
-
-    ;
-    ; INT13 Func 42 - Extended Read Sectors
-    ;
-    ; Arguments:
-    ;   AH    = 0x42
-    ;   DL    = drive number (80h + drive unit)
-    ;   DS:SI = pointer to Disk Address Packet
-    ;
-    ; Returns:
-    ;   AH    = return status (sucess is 0)
-    ;   carry = 0 success
-    ;           1 error
-    ;
-    ; Packet offset 2 indicates the number of sectors read
-    ; successfully.
-    ;
-    mov     si, sp
-    mov     ah, 0x42
-    int     0x13
-
-    jnc     .exit
-
-    DebugChar('R')                  ; indicate INT13/F42 error
-
-    ;
-    ; Issue a disk reset on error.
-    ; Should this be changed to Func 0xD to skip the diskette controller
-    ; reset?
-    ;
-    xor     ax, ax                  ; Func 0
-    int     0x13                    ; INT 13
-    stc                             ; set carry to indicate error
-
-.exit:
-    mov     sp, bp                  ; restore SP
-    popad
+load_error:
+    mov     al, 1                   ; error
+    pop     ds                      ; restore ds
     ret
 
-
 ;--------------------------------------------------------------------------
-; Write a string with 'boot0: ' prefix to the console.
+; Print a character.
 ;
-; Arguments:
-;   ES:DI   pointer to a NULL terminated string.
-;
-; Clobber list:
-;   DI
-;
-log_string:
-    pusha
-
-    push    di
-    mov     si, log_title_str
-    call    print_string
-
-    pop     si
-    call    print_string
-
-    popa
-
-    ret
-
-
-;--------------------------------------------------------------------------
-; Write a string to the console.
-;
-; Arguments:
-;   DS:SI   pointer to a NULL terminated string.
-;
-; Clobber list:
-;   AX, BX, SI
-;
-print_string:
-    mov     bx, 1                   ; BH=0, BL=1 (blue)
-    cld                             ; increment SI after each lodsb call
-.loop:
-    lodsb                           ; load a byte from DS:SI into AL
-    cmp     al, 0                   ; Is it a NULL?
-    je      .exit                   ; yes, all done
-    mov     ah, 0xE                 ; INT10 Func 0xE
-    int     0x10                    ; display byte in tty mode
-    jmp     short .loop
-.exit:
-    ret
-
-
-%if DEBUG
-
-;--------------------------------------------------------------------------
-; Write a ASCII character to the console.
-;
-; Arguments:
-;   AL = ASCII character.
+; Input:
+;   al = character to print
 ;
 print_char:
-    pusha
-    mov     bx, 1                   ; BH=0, BL=1 (blue)
-    mov     ah, 0x0e                ; bios INT 10, Function 0xE
-    int     0x10                    ; display byte in tty mode
-    popa
+    mov     ah, kPrintChar          ; print character
+    int     kPrintInt               ; print character
     ret
 
-
 ;--------------------------------------------------------------------------
-; Write the 4-byte value to the console in hex.
+; Print a hex digit.
 ;
-; Arguments:
-;   EAX = Value to be displayed in hex.
+; Input:
+;   al = digit to print
 ;
 print_hex:
-    pushad
-    mov     cx, WORD 4
-    bswap   eax
-.loop:
-    push    ax
-    ror     al, 4
-    call    print_nibble            ; display upper nibble
-    pop     ax
-    call    print_nibble            ; display lower nibble
-    ror     eax, 8
-    loop    .loop
+    cmp     al, 10                  ; compare to 10
+    jb      print_hex_1             ; branch if less than 10
+    add     al, 'A' - 10            ; convert to ASCII
+    jmp     print_hex_2             ; print character
 
-    mov     al, 10                  ; carriage return
-    call    print_char
-    mov     al, 13
-    call    print_char
+print_hex_1:
+    add     al, '0'                 ; convert to ASCII
 
-    popad
+print_hex_2:
+    call    print_char              ; print character
     ret
-
-print_nibble:
-    and     al, 0x0f
-    add     al, '0'
-    cmp     al, '9'
-    jna     .print_ascii
-    add     al, 'A' - '9' - 1
-.print_ascii:
-    call    print_char
-    ret
-
-getc:
-    pusha
-    mov    ah, 0
-    int    0x16
-    popa
-    ret
-%endif ;DEBUG
-
 
 ;--------------------------------------------------------------------------
-; NULL terminated strings.
+; Print a string.
 ;
+; Input:
+;   es:di = pointer to string
+;
+print_string:
+    mov     al, [es:di]             ; get character
+    or      al, al                  ; check for end of string
+    jz      print_string_done       ; done if end of string
+    call    print_char              ; print character
+    inc     di                      ; next character
+    jmp     print_string            ; loop until end of string
 
-%if VERBOSE
-gpt_str         db  'GPT', 0
-test_str        db  'test', 0
-done_str        db  'done', 0
-%endif
-
-boot_error_str  db  'error', 0
+print_string_done:
+    ret
 
 ;--------------------------------------------------------------------------
-; Pad the rest of the 512 byte sized booter with zeroes. The last
-; two bytes is the mandatory boot sector signature.
-;
-; If the booter code becomes too large, then nasm will complain
-; that the 'times' argument is negative.
-
-;
-; According to EFI specification, maximum boot code size is 440 bytes
-;
-
-pad_boot:
-    times  428-($-$$) db 0  ; 428 = 440 - len(log_title_str)
-
-log_title_str:
-    db  10, 13, 'boot0af: ', 0  ; can be use as signature
-
-pad_table_and_sig:
-    times 510-($-$$) db 0
-    dw    kBootSignature
-
-    ABSOLUTE 0xE400
-
-;
-; In memory variables.
-;
-my_lba          resd    1   ; Starting LBA for read_lba function
-
-; END
