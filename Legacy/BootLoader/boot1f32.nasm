@@ -189,14 +189,67 @@ start:
     ; set up the stack to grow down from kBoot1StackSegment:kBoot1StackAddress.
     ; Interrupts should be off while the stack is being manipulated.
     ;
-    cli                             ; interrupts off
-    xor     eax, eax                ; zero ax
-    mov     ss, ax                  ; ss <- 0
-    mov     sp, kBoot1StackAddress  ; sp <- top of stack
-    sti                             ; reenable interrupts
+    cli
+    mov     sp, kBoot1StackAddress
+    mov     ss, kBoot1StackSegment
 
-    mov     ds, ax                  ; ds <- 0
-    mov     es, ax                  ; es <- 0
+    ;
+    ; Save the BIOS drive number.
+    ;
+    mov     gBIOSDriveNumber, dl
+
+    ;
+    ; Read the first sector of the partition.
+    ;
+    mov     cx, 0
+    mov     ax, kSectorBytes
+    mov     bx, gPartLBA
+    call    readSectors
+
+    ;
+    ; Check the boot signature.
+    ;
+    cmp     word [gPartLBA * kSectorBytes + kBootSignature], kBootSignature
+    jne     error
+
+    ;
+    ; Save the partition start LBA and size.
+    ;
+    mov     bx, gPartLBA
+    mov     ax, word [bx + part_size + part_lba]
+    mov     word [gPartLBA], ax
+    mov     ax, word [bx + part_size + part_lba + 2]
+    mov     word [gPartLBA + 2], ax
+    mov     ax, word [bx + part_size + part_sectors]
+    mov     word [gPartSize], ax
+    mov     ax, word [bx + part_size + part_sectors + 2]
+    mov     word [gPartSize + 2], ax
+
+    ;
+    ; Save the FAT sector count.
+    ;
+    mov     bx, gPartLBA
+    mov     ax, word [bx + part_size + part_sectors]
+    mov     word [gSectPerFat], ax
+    mov     ax, word [bx + part_size + part_sectors + 2]
+    mov     word [gSectPerFat + 2], ax
+
+    ;
+    ; Save the root directory cluster.
+    ;
+    mov     bx, gPartLBA
+    mov     ax, word [bx + part_size + part_lba]
+    mov     word [gRootCluster], ax
+    mov     ax, word [bx + part_size + part_lba + 2]
+    mov     word [gRootCluster + 2], ax
+
+    ;
+    ; Read the 'boot' file.
+    ;
+    mov     cx, 0
+    mov     ax, kBoot2Sectors
+    mov     bx, kBoot2Address
+    call    readSectors
 
     ;
     ; Initializing global variables.
@@ -373,232 +426,120 @@ readSectors:
     ret
 
 ;--------------------------------------------------------------------------
-; readLBA - Read sectors from a partition using LBA addressing.
+; readLBA - Reads sectors using LBA addressing.
 ;
 ; Arguments:
-;   AL = number of 512-byte sectors to read (valid from 1-127).
+;   AX = number of 512-byte sectors to read (valid from 1-128).
 ;   EDX = pointer to where the sectors should be stored.
-;   ECX = sector offset in partition
-;   [bios_drive_number] = drive number (0x80 + unit number)
+;   ECX = LBA sector offset in partition
 ;
 ; Returns:
+;   AX = number of sectors read
 ;   CF = 0  success
 ;        1 error
 ;
 readLBA:
-    pushad                                  ; save all registers
-    push    es                              ; save ES
-    mov     bp, sp                          ; save current SP
-
-    ;
-    ; Convert EDX to segment:offset model and set ES:BX
-    ;
-    ; Some BIOSes do not like offset to be negative while reading
-    ; from hard drives. This usually leads to "boot1: error" when trying
-    ; to boot from hard drive, while booting normally from USB flash.
-    ; The routines, responsible for this are apparently different.
-    ; Thus we split linear address slightly differently for these
-    ; capricious BIOSes to make sure offset is always positive.
-    ;
-
-    mov     bx, dx                          ; save offset to BX
-    and     bh, 0x0f                        ; keep low 12 bits
-    shr     edx, 4                          ; adjust linear address to segment base
-    xor     dl, dl                          ; mask low 8 bits
-    mov     es, dx                          ; save segment to ES
-
-    ;
-    ; Create the Disk Address Packet structure for the
-    ; INT13/F42 (Extended Read Sectors) on the stack.
-    ;
-
-    ; push    DWORD 0                       ; offset 12, upper 32-bit LBA
-    push    ds                              ; For sake of saving memory,
-    push    ds                              ; push DS register, which is 0.
-
-    add     ecx, [gPartLBA]                 ; offset 8, lower 32-bit LBA
-    push    ecx
-
-    push    es                              ; offset 6, memory segment
-
-    push    bx                              ; offset 4, memory offset
-
-    xor     ah, ah                          ; offset 3, must be 0
-    push    ax                              ; offset 2, number of sectors
-
-    push    WORD 16                         ; offset 0-1, packet size
-
-    ;
-    ; INT13 Func 42 - Extended Read Sectors
-    ;
-    ; Arguments:
-    ;   AH    = 0x42
-    ;   [bios_drive_number] = drive number (0x80 + unit number)
-    ;   DS:SI = pointer to Disk Address Packet
-    ;
-    ; Returns:
-    ;   AH    = return status (sucess is 0)
-    ;   carry = 0 success
-    ;           1 error
-    ;
-    ; Packet offset 2 indicates the number of sectors read
-    ; successfully.
-    ;
-    mov     dl, [gBIOSDriveNumber]          ; load BIOS drive number
-    mov     si, sp
-    mov     ah, 0x42
-    int     0x13
-
-    jc      error
-
-    ;
-    ; Issue a disk reset on error.
-    ; Should this be changed to Func 0xD to skip the diskette controller
-    ; reset?
-    ;
-;   xor     ax, ax                          ; Func 0
-;   int     0x13                            ; INT 13
-;   stc                                     ; set carry to indicate error
-
-.exit:
-    mov     sp, bp                          ; restore SP
-    pop     es                              ; restore ES
-    popad
-    ret
-
-%if VERBOSE
-
-;--------------------------------------------------------------------------
-; Write a string with 'boot1: ' prefix to the console.
-;
-; Arguments:
-;   ES:DI   pointer to a NULL terminated string.
-;
-; Clobber list:
-;   DI
-;
-log_string:
-    pushad
-
+    push    es
+    push    ds
+    push    si
     push    di
-    mov     si, log_title_str
-    call    print_string
-
+    push    bp
+    mov     si, edx
+    mov     es, si
+    mov     bp, es
+    shr     si, 16
+    mov     di, si
+    mov     si, edx
+    mov     ds, si
+    and     si, 0ffffh
+    mov     ax, 0x4200
+    mov     bx, 0x0000
+    mov     dx, [gBIOSDriveNumber]
+    mov     cx, ax
+    mov     ax, 0x0000
+    int     0x13
+    jc      error
+    mov     ax, cx
+    pop     bp
+    pop     di
     pop     si
-    call    print_string
-
-    popad
-
+    pop     ds
+    pop     es
     ret
 
-;-------------------------------------------------------------------------
-; Write a string to the console.
-;
-; Arguments:
-;   DS:SI   pointer to a NULL terminated string.
-;
-; Clobber list:
-;   AX, BX, SI
-;
-print_string:
-    mov     bx, 1                           ; BH=0, BL=1 (blue)
-
-.loop:
-    lodsb                                   ; load a byte from DS:SI into AL
-    cmp     al, 0                           ; Is it a NULL?
-    je      .exit                           ; yes, all done
-    mov     ah, 0xE                         ; INT10 Func 0xE
-    int     0x10                            ; display byte in tty mode
-    jmp     .loop
-
-.exit:
+error:
+    mov     ax, 0
+    pop     bp
+    pop     di
+    pop     si
+    pop     ds
+    pop     es
     ret
-
-%endif ; VERBOSE
-
-%if DEBUG
-
-;--------------------------------------------------------------------------
-; Write the 4-byte value to the console in hex.
-;
-; Arguments:
-;   EAX = Value to be displayed in hex.
-;
-print_hex:
-    pushad
-    mov     cx, WORD 4
-    bswap   eax
-.loop:
-    push    ax
-    ror     al, 4
-    call    print_nibble                    ; display upper nibble
-    pop     ax
-    call    print_nibble                    ; display lower nibble
-    ror     eax, 8
-    loop    .loop
-
-    popad
-    ret
-
-print_nibble:
-    and     al, 0x0f
-    add     al, '0'
-    cmp     al, '9'
-    jna     .print_ascii
-    add     al, 'A' - '9' - 1
-.print_ascii:
-    call    print_char
-    ret
-
-;--------------------------------------------------------------------------
-; getc - wait for a key press
-;
-getc:
-    pushad
-    mov     ah, 0
-    int     0x16
-    popad
-    ret
-
-;--------------------------------------------------------------------------
-; Write a ASCII character to the console.
-;
-; Arguments:
-;   AL = ASCII character.
-;
-print_char:
-    pushad
-    mov     bx, 1                           ; BH=0, BL=1 (blue)
-    mov     ah, 0x0e                        ; bios INT 10, Function 0xE
-    int     0x10                            ; display byte in tty mode
-    popad
-    ret
-
-%endif ; DEBUG
-
-;--------------------------------------------------------------------------
-; Static data.
-;
 
 %if VERBOSE
-log_title_str   db      CR, LF, 'b1f: ', NULL
-init_str        db      'init', NULL
-error_str       db      'error', NULL
+    LogString(boot1_str)
 %endif
 
+%if DEBUG
+    DebugChar ('!')
+%endif
+
+    mov     dl, [gBIOSDriveNumber]          ; load BIOS drive number
+    jmp     kBoot2Segment:kBoot2Address
+
+dserror:
+    pop ds
+
+error:
+
+%if VERBOSE
+    LogString(error_str)
+%endif
+
+hang:
+    hlt
+    jmp     hang
+
+    ; readCluster - Reads cluster EAX to (EDX), updates EAX to next cluster
+readCluster:
+    cmp     eax, 0x0ffffff8
+    jb      do_read
+    stc
+    ret
+
+do_read:
+    push    eax
+    xor     ecx,ecx
+    dec     eax
+    dec     eax
+    mov     cl, [gSPC]
+    push    edx
+    mul
+    pop     edx
+    add     eax, [gSectPerFat]
+    mov     ecx, eax
+    xor     ah,ah
+    mov     al, [gSPC]
+    call    readSectors
+    jc      clusend
+    pop     ecx
+    push    cx
+    shr     ecx, 7
+    xor     ax, ax
+    inc     ax
+    mov     edx, FATBUF
+    call    readSectors
+    jc      clusend
+    pop     si
+    and     si, 0x7f
+    shl     si, 2
+    mov     eax, [FATBUF + si]
+    and     eax, 0x0fffffff
+    clc
+    ret
+
+clusend:
+    pop     eax
+    ret
+
 ;--------------------------------------------------------------------------
-; Pad the rest of the 512 byte sized sector with zeroes. The last
-; two bytes is the mandatory boot sector signature.
-;
-; If the booter code becomes too large, then nasm will complain
-; that the 'times' argument is negative.
-
-pad_table_and_sig:
-    times           496-($-$$) db 0
-    ; We will put volume magic identifier here
-    times           14 db 0
-    dw              kBootSignature
-
-    ABSOLUTE        kBoot1LoadAddr + kSectorBytes
-
-; END
